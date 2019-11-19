@@ -1,0 +1,237 @@
+---
+title: "Calculating Property Values- Cuyahoga"
+author: "Lucia Walinchus- Ohio Center for Investigative Journalism"
+date: "6/20/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(rio)
+devtools::install_github("smach/rmiscutils")
+library(lubridate)
+library(scales)
+library(DT)
+```
+
+## Getting the Data
+This is downloaded from the County Auditor and Recorder's Data. And some FOIA data. This can be any spreadsheet of county data as long as it has the parcel number, mortgage amount, tax district, effective rate, owner name, sale date, and (Auditor's) market value. 
+
+Note: This is only commerical properties, in the Commerical/Industrial land use codes. The mortgages are incomplete. (See our methodology for more.)
+
+```{r cars}
+#importing data
+Commercial_Properties <- rio::import("Cuyahoga Properties last verified 8-07-19.csv") #OR wherever your file is
+#Exempt properties taken out, as per auditor's edit. 
+Commercial_Properties <- filter(Commercial_Properties, NET_TAX_OWED_1ST>0)
+
+
+```
+
+## Calculating Baseline
+
+What is the amount owed to each county? 
+
+Note: in theory we would just add all the taxes_paid and there's always going to be a certain percentage of people behind on their taxes, and we're not interested in that. So here we are calculating the total amount to taxes collected in theory.
+
+Second Note: Each year, new properties are built. This doesn't decrease the tax rate. It just adds to the amount of property tax collected. So this is essentially a snapshot. 
+
+Third caveat: We collected this data over several months so it's always going to be slightly out of date, as people are constantly buying, building, and selling new properites. We're interested in the best estimate. 
+```{r}
+Commercial_Properties <- mutate(Commercial_Properties, Amount_Owed_to_County=market_value*EFFECTIVE_RATE*.35*.001)
+
+```
+
+
+
+
+
+How much does each district raise? 
+
+```{r pressure, echo=FALSE}
+Amount_Due_Per_Tax_District <- Commercial_Properties %>% 
+  group_by(TAXSET_DESCR) %>% 
+  summarize(Total_Per_District =sum(Amount_Owed_to_County))
+knitr::kable(Amount_Due_Per_Tax_District)
+```
+
+How much is that altogether? 
+
+```{r}
+  sum(na.omit(Amount_Due_Per_Tax_District$Total_Per_District))
+```
+That same number, but written as currency with commas so you can read: 
+
+```{r}
+scales::dollar(.Last.value)
+```
+
+#Putting single purchases together
+
+First, our data is in the wrong format. When the date, owner, and amount are the same, the sale amount is actually for ALL the properties together. But there are different parcel numbers because large properties are usually composed of several parcels next to each other.
+
+So for example, parcels 123, 456, and 789 are are listed as sold to Company LLC on June 22, 2019 for 6 million dollars. But each is not worth 6 million. They are worth 1, million, 2 million, and 3 million dollars respectively. All the properties together are worth valued at 6 million dollars, BUT the mortgage amount field on each reads 6 million dollars. And we don't want to accidentally log it as 18 million dollars.
+
+So here we will group by owner, date of mortgage, and the mortgage amount. But then we run into another problem: Some of these have multiple tax districts:
+
+```{r}
+Looking_For_Sort_of_duplicates <- Commercial_Properties %>% 
+  group_by(GranteeName,RecordedDate,mortgage_amount) %>% 
+  count(TAXSET_DESCR)  
+datatable(Looking_For_Sort_of_duplicates)
+```
+
+If you sort by n (which stands for the number of tax districts,) you can see that each purchase goes from 1 to 190,000 properties, though thankfully most are just 1. This really complicates our analysis, though, because we need the tax district to get the effective rate which is what we will multiply our new value by. 
+
+So first, we need to create a proportion for our tax district. A purchase that is in just one tax district will have a multiplier of 1. The rest will be a proportion of the current value. 
+
+For example, let's say we purchased an LLC business for one million dollars (the mortgage) on two parcels of land in two tax districts and it is on the books as being 500,000 dollars total, (the Auditor's market value.) Parcel A is listed as being worth 100,000 dollars in tax district 1 and Parcel B is listed being worth 400,000 dollars in tax district 2. Then we would have a parcel A multiplier of .2 (or 20 percent of the value) and parcel B having a multiplier of .8 (eighty percent of the value.)
+
+```{r}
+Commercial_Properties <- Commercial_Properties %>%
+  group_by(GranteeName,RecordedDate,mortgage_amount) %>% 
+  mutate(Auditors_Total_Value_of_Parcels =sum(market_value)) %>%  #This creates a total for each transaction
+  ungroup() %>% 
+  mutate(Share_of_Market_Value = market_value/Auditors_Total_Value_of_Parcels) #This creates the share of the value
+#Some parcels are valued at Zero, and therefore, dividing by 0 gives you NA. Which screws up our calculations further on. So for the 173 NAs here we will just set them to zero
+Commercial_Properties$Share_of_Market_Value[is.na(Commercial_Properties$Share_of_Market_Value)] <- 0
+
+
+```
+
+Okay now we are looking for outliers. 
+
+In the Athens apartment case that is our example, (https://realestate.cleveland.com/realestate-news/2018/08/big_big_money_legal_loopholes.html) the mortgage was for so much more than the assessed value because it hadn't be sold in like ~20 years. Every year the state takes the property's past value, and estimates what someone would want to buy it for, given how many bedrooms and square footage and the neighborhood and whatnot. But really, the value of something is how much someone else wants to pay for it. When the missing tax value is because it was an LLC transfer, that's what we are looking for. 
+
+Assessors generally try to assess a property at about 80 to 90 percent of its "true value" to allow for property prices to ebb and flow a bit. So in our case, we are going to see if a mortgage is 20 percent more than its listed value. 
+
+
+#Looking for Outliers
+
+```{r}
+#Creating a column that shows what twenty percent more is
+Commercial_Properties <- Commercial_Properties %>% 
+  group_by(GranteeName, RecordedDate, mortgage_amount) %>%
+  mutate(Twenty_Percent_More = (Auditors_Total_Value_of_Parcels+.2*Auditors_Total_Value_of_Parcels)) %>% 
+#Creating a column that shows if the mortgage value is twenty percent more than the property value. If a bank is willing to bet a significant amount more than the property value, then that is tax dollars lost. 
+  mutate(Is_This_A_Potential_Outlier = ifelse(mortgage_amount > Twenty_Percent_More, "TRUE", "FALSE" )) %>% 
+  ungroup()
+
+
+```
+
+#Verification 
+
+Now this is the part where we want to certify that all our numbers are correct. 
+
+For example, in Warren County parcel numbers 15045020040, 16365020010, 16365020011, 12205020010, 12355020010, 11065020010, and 12145020020 have a mortgage of 2.55 million but their auditor's "market value" is only ~125K. Why would a bank give a railroad 2.55 million dollars for property only worth $125K? They wouldn't. 
+
+If you look at the recorder's info, this is a mortgage for not just Warren county but the whole railroad up from Cincy to Columbus And fixtures, too. Probably trains in this case. 
+
+Later note: this wasn't in our calculations anyway, but utilities are taxed by the state and not the county as it turns out. 
+
+
+So here we export the data, create a "verified" column, and re-import it. 
+
+
+
+
+```{r}
+#So uncomment this to export
+#rio::export(Commercial_Properties, "Cuyahoga Commercial Properties.csv")
+
+
+```
+#Data Verification Part II
+
+This gets exported, then a human looks at the biggest outliers to see if they are true, or if they are like the example above. Then the file is re-imported. You can skip the data verification part if this doesn't apply. 
+
+```{r}
+#uncomment this and add your new file name with the amounts you have verified. (Via human)
+#Commercial_Properties <- rio::import("Cuyahoga_Commerical_Properties_With_2016_to_2019_mortgages.csv") #Or whatever your new, verified filename is.
+```
+
+#Calculating the new values
+
+Now we want to take the mortgage amount as the market amount, assuming we have verified it. 
+
+So this says, if this is a potential outlier, and we have verifed that the outlier is true, then take the mortgage amount as the value. If not take the market value. 
+
+```{r}
+Commercial_Properties$mortgage_amount <- as.numeric(Commercial_Properties$mortgage_amount)
+
+#First we need to set the NAs in mortgage amount to zero or we get an error further down when we are calculating things from it
+Commercial_Properties$mortgage_amount[is.na(Commercial_Properties$mortgage_amount)] <- 0
+
+#This was bugging as not logical for some reason, though the answers were all true or false.
+#Commercial_Properties$Is_This_A_Potential_Outlier <- type.convert(Commercial_Properties$Is_This_A_Potential_Outlier, na.strings = "NA", logical)
+
+Commercial_Properties <- Commercial_Properties %>% 
+  mutate(Mortgage_Share=mortgage_amount*Share_of_Market_Value) %>% 
+  mutate(True_Value=ifelse(Is_This_A_Potential_Outlier=="TRUE" & Verified!="RED", Mortgage_Share, market_value))
+
+
+#This looks duplicative, and it is, but if not we introduce NAs by coercian
+Commercial_Properties <- Commercial_Properties %>% 
+  group_by(GranteeName, RecordedDate, mortgage_amount) %>%
+  mutate(Twenty_Percent_More = (Auditors_Total_Value_of_Parcels+.2*Auditors_Total_Value_of_Parcels)) %>% 
+  mutate(Is_This_A_Potential_Outlier = ifelse(mortgage_amount > Twenty_Percent_More, "TRUE", "FALSE" )) %>% 
+  ungroup()
+Commercial_Properties <- Commercial_Properties %>% 
+  mutate(Mortgage_Share=mortgage_amount*Share_of_Market_Value) %>% 
+  mutate(True_Value=ifelse(Is_This_A_Potential_Outlier=="TRUE" & Verified!="RED", Mortgage_Share, market_value))
+
+
+```
+
+#Recalculating potential taxes 
+
+How much COULD the county raise if we knew the value of LLC businesses?
+
+What was the value of taxable assets before and after finding more value?
+
+
+```{r}
+#First, any True_Values that are 
+scales::dollar(sum(Commercial_Properties$market_value))
+Commercial_Properties$True_Value[is.na(Commercial_Properties$True_Value)] <- 0
+scales::dollar(sum(Commercial_Properties$True_Value))
+```
+
+#Calculating each district
+
+What would the new tax rate be compared to the old tax rate? 
+
+First, we can't average the rates, as shown by this very high-tech post-it: 
+![Can't average the rates ](https://eyeonohio.com/wp-content/uploads/2019/07/CannotAverage-e1562181956163.jpg)
+Sorry this is badly labeled, which I realized later. But essentially, on the top is the original calculation. There are two parcels worth 100 and 200 dollars. Both are in a district where the tax rate is .5. If we later determine that those parcel are actually worth 200 and 300, then the district is still going to collect 50 and 100 respectively. But the tax rate for each goes down. 
+
+We calculated the proportion that each parcel of land is, because sometimes businesses bought parcels that were in multiple tax districts. But to figure out the new tax rate, we will have to determine the amount per district. And then determine the new tax rate per district. 
+
+
+What's the median property value in each tax district? What do they pay now? how much would they pay if we knew the true value of LLC transfers? 
+
+```{r}
+Tax_Rate_Comparison <- Commercial_Properties %>% 
+  group_by(TAXSET_DESCR) %>% 
+  summarize(
+    Total_Per_District =sum(Amount_Owed_to_County),
+    New_Taxable_Value=sum(True_Value*.35),
+    Old_Rate=mean(EFFECTIVE_RATE)*.001,
+    New_Rate=(Total_Per_District/New_Taxable_Value),
+    Median_Property_Value=median(market_value),
+    Current_Median_Tax_Bill=(Median_Property_Value*Old_Rate),
+    Possible_Median_Tax_Bill=Median_Property_Value*New_Rate,
+    Amount_Overpaid_By_Median_Owner=Current_Median_Tax_Bill-Possible_Median_Tax_Bill)
+datatable(Tax_Rate_Comparison)
+```
+
+This looks at the summary of what the median overpaid. It ranges from nothing to several thousand dollars. And again that's just the median. We could enter find any property and figure out what they would pay. 
+
+```{r}
+summary(Tax_Rate_Comparison$Amount_Overpaid_By_Median_Owner)
+```
+
+
+
